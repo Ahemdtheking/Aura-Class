@@ -1,0 +1,48 @@
+{
+  "rules": {
+    "profilesById": {
+      "$role": {
+        "$profileId": {
+          ".read": "auth != null",
+          ".write": "auth != null && ($role == 'Student' || $role == 'Teacher') && newData.child('uid').val() == auth.uid && newData.child('id').val() == $profileId && newData.child('role').val() == $role && (!data.exists() || data.child('uid').val() == auth.uid)",
+          ".validate": "newData.hasChildren(['uid', 'id', 'name', 'role']) && newData.child('role').val() == $role && newData.child('id').val() == $profileId"
+        }
+      }
+    },
+    "classes": {
+      "$classId": {
+        ".read": "auth != null",
+        ".write": "auth != null && ((!data.exists() && newData.child('ownerUid').val() == auth.uid) || (data.exists() && data.child('ownerUid').val() == auth.uid && newData.child('ownerUid').val() == auth.uid))",
+        ".validate": "newData.hasChildren(['classId', 'ownerUid', 'teacherId', 'teacherName', 'title', 'subtitle', 'topic', 'next', 'duration', 'createdAt']) && newData.child('classId').val() == $classId && newData.child('ownerUid').val() == auth.uid"
+      }
+    },
+    "teacherClasses": {
+      "$teacherUid": {
+        ".read": "auth != null && auth.uid == $teacherUid",
+        "$classId": {
+          ".write": "auth != null && auth.uid == $teacherUid && newData.child('ownerUid').val() == auth.uid && newData.child('classId').val() == $classId",
+          ".validate": "newData.hasChildren(['classId', 'ownerUid', 'teacherId', 'title'])"
+        }
+      }
+    },
+    "teacherRosters": {
+      "$teacherUid": {
+        ".read": "auth != null && auth.uid == $teacherUid",
+        "$studentUid": {
+          ".write": "auth != null && auth.uid == $teacherUid && (!newData.exists() || (newData.child('uid').val() == $studentUid && root.child('profilesById').child('Student').child(newData.child('studentId').val()).child('uid').val() == $studentUid))",
+          ".validate": "newData.hasChildren(['uid', 'studentId', 'name', 'addedAt']) && newData.child('uid').val() == $studentUid"
+        }
+      }
+    },
+    "classMembers": {
+      "$classId": {
+        ".read": "auth != null && root.child('classes').child($classId).child('ownerUid').val() == auth.uid",
+        "$studentUid": {
+          ".read": "auth != null && (auth.uid == $studentUid || root.child('classes').child($classId).child('ownerUid').val() == auth.uid)",
+          ".write": "auth != null && root.child('classes').child($classId).exists() && ((!newData.exists() && (auth.uid == $studentUid || root.child('classes').child($classId).child('ownerUid').val() == auth.uid)) || (newData.exists() && newData.child('uid').val() == $studentUid && (auth.uid == $studentUid || root.child('classes').child($classId).child('ownerUid').val() == auth.uid)))",
+          ".validate": "newData.hasChildren(['uid', 'studentId', 'name', 'joinedAt']) && newData.child('uid').val() == $studentUid"
+        }
+      }
+    }
+  }
+}

@@ -49,6 +49,8 @@ localStorage.removeItem('aura.demo-session');
 const state = { screen:'auth', page:'home', role:'Student', user:null, pendingUser:null, bookmarks:new Set(), notificationsOpen:false, weekOffset:0 };
 let live = null;
 let reminderTimers=[];
+let cloudTeacherSyncInFlight=false;
+let lastCloudTeacherSyncAt=0;
 
 function sidebar() {
   const groups = state.role === 'Teacher' ? teacherNavGroups : studentNavGroups;
@@ -78,6 +80,68 @@ function eventRow(event) { return `<div class="event-item"><div class="event-tim
 function stat(iconName, label, value, trend, color = '') { return `<div class="stat-card"><div class="stat-top"><span>${label}</span><div class="stat-icon ${color}">${icon(iconName)}</div></div><div class="stat-value">${value}<span class="stat-trend">${trend}</span></div></div>`; }
 function currentId(){return state.user?.id||'';}
 function allCourses(){return [...courses,...(classData.additionalCourses||[])];}
+function cloudCourse(record){
+  const id=String(record.classId||record.id||'').toUpperCase();
+  return {id,ownerUid:record.ownerUid||'',teacherId:record.teacherId||'',title:record.title||'Aura Class',subtitle:record.subtitle||`${record.teacherName||'Teacher'}${record.topic?` · ${record.topic}`:''}`,topic:record.topic||'',progress:0,code:String(record.title||'A').slice(0,1).toUpperCase(),color:'',next:record.next||'Set in your class routine',duration:record.duration||'Live session',studentIds:[]};
+}
+function mergeCloudStudent(profile){
+  if(!profile?.uid||!profile?.id||profile.role!=='Student')return null;
+  const existing=classData.users.find(user=>user.uid===profile.uid||String(user.id||'').toUpperCase()===String(profile.id).toUpperCase());
+  const merged={...(existing||{}),uid:profile.uid,id:profile.id,name:profile.name||'Student',role:'Student',photoURL:profile.photoURL||existing?.photoURL||'',email:existing?.email||'',profilePending:false};
+  if(existing)Object.assign(existing,merged);else classData.users.push(merged);
+  return merged;
+}
+async function publishCloudProfile(profile){
+  if(!window.auraClassCloud?.configured||!profile?.uid)return;
+  try{await window.auraClassCloud.publishProfile(profile);}
+  catch(error){console.warn('Aura Class profile sync failed:',error);}
+}
+async function syncCloudTeacherData(){
+  const cloud=window.auraClassCloud;
+  const now=Date.now();
+  if(!cloud?.configured||state.screen!=='app'||state.role!=='Teacher'||!state.user?.uid||cloudTeacherSyncInFlight||now-lastCloudTeacherSyncAt<15000)return;
+  cloudTeacherSyncInFlight=true;lastCloudTeacherSyncAt=now;
+  let changed=false;
+  try{
+    let [remoteCourses,remoteRoster]=await Promise.all([cloud.listTeacherClasses(state.user.uid),cloud.listTeacherRoster(state.user.uid)]);
+    const knownIds=new Set(remoteCourses.map(record=>String(record.classId||record.id||'').toUpperCase()));
+    const localTeacherCourses=(classData.additionalCourses||[]).filter(course=>course.teacherId===currentId()&&!knownIds.has(String(course.id||'').toUpperCase()));
+    for(const course of localTeacherCourses){
+      try{
+        const selectedProfiles=classData.users.filter(user=>(course.studentIds||[]).includes(user.id)&&user.role==='Student');
+        const published=await cloud.publishClass(course,selectedProfiles);
+        remoteCourses.push(published);knownIds.add(String(published.classId).toUpperCase());changed=true;
+      }catch(error){console.warn(`Aura Class could not publish local class ${course.id}:`,error);}
+    }
+    classData.additionalCourses=classData.additionalCourses||[];
+    classData.rosters=classData.rosters||{};
+    classData.rosters[currentId()]=classData.rosters[currentId()]||[];
+    for(const record of remoteCourses){
+      const incoming=cloudCourse(record);const existing=classData.additionalCourses.find(course=>course.id===incoming.id);
+      if(existing)Object.assign(existing,{...incoming,studentIds:existing.studentIds||[]});
+      else{classData.additionalCourses.push(incoming);changed=true;}
+    }
+    for(const record of remoteRoster){
+      const profile=mergeCloudStudent({uid:record.uid,id:record.studentId,name:record.name,role:'Student'});
+      if(profile&&!classData.rosters[currentId()].includes(profile.id)){classData.rosters[currentId()].push(profile.id);changed=true;}
+    }
+    const membersByClass=await Promise.all(remoteCourses.map(async record=>({record,members:await cloud.listClassMembers(record.classId||record.id)})));
+    for(const {record,members} of membersByClass){
+      const course=classData.additionalCourses.find(item=>item.id===String(record.classId||record.id).toUpperCase());
+      for(const member of members){
+        const profile=mergeCloudStudent({uid:member.uid,id:member.studentId,name:member.name,role:'Student'});
+        if(!profile)continue;
+        if(!classData.rosters[currentId()].includes(profile.id)){classData.rosters[currentId()].push(profile.id);changed=true;}
+        classData.enrollments[profile.id]=classData.enrollments[profile.id]||[];
+        if(!classData.enrollments[profile.id].includes(course.id)){classData.enrollments[profile.id].push(course.id);changed=true;}
+        course.studentIds=course.studentIds||[];
+        if(!course.studentIds.includes(profile.id)){course.studentIds.push(profile.id);changed=true;}
+      }
+    }
+    if(changed){persistClassData();if(state.screen==='app')render();}
+  }catch(error){console.warn('Aura Class class and roster sync failed:',error);}
+  finally{cloudTeacherSyncInFlight=false;}
+}
 function visibleCourses(){const id=currentId();if(state.role==='Teacher')return allCourses().filter(course=>course.teacherId===id);const enrolled=classData.enrollments[id]||[];return allCourses().filter(course=>enrolled.includes(course.id)||course.studentIds?.includes(id));}
 function visibleRoutines(){const id=currentId();const allowed=new Set(visibleCourses().map(course=>course.id));return classData.routines.filter(item=>state.role==='Teacher'?item.teacherId===id:allowed.has(item.courseId)).sort((a,b)=>`${a.date}T${a.time}`.localeCompare(`${b.date}T${b.time}`)).map(item=>({...item,time:new Date(`2000-01-01T${item.time}`).toLocaleTimeString('en-US',{hour:'numeric',minute:'2-digit'}),sub:`${item.topic} · ${item.room}`}));}
 function visibleExams(){const id=currentId();const enrolled=new Set(classData.enrollments[id]||[]);return classData.exams.filter(item=>state.role==='Teacher'?item.teacherId===id:((item.assignedStudents||[]).includes(id)||enrolled.has(item.courseId))).sort((a,b)=>a.date.localeCompare(b.date));}
@@ -176,7 +240,7 @@ function updateProfileView(user) {
   try{profile=JSON.parse(localStorage.getItem(userKey));}catch{}
   if(profile&&['Student','Teacher'].includes(profile.role)){
     state.user={...authProfile(user,profile.role,profile.id),...profile,name:user.displayName||profile.name,email:user.email||profile.email||'',photoURL:user.photoURL||profile.photoURL||'',provider:authProfile(user,profile.role,profile.id).provider,emailVerified:!!user.emailVerified,createdAt:user.metadata?.creationTime||profile.createdAt||'',lastSignInTime:user.metadata?.lastSignInTime||profile.lastSignInTime||''};
-    localStorage.setItem(userKey,JSON.stringify(state.user));state.role=profile.role;state.screen='app';state.page='home';state.bookmarks=new Set(classData.bookmarks?.[profile.id]||[]);saveDirectoryProfile(state.user);scheduleBrowserReminders();
+    localStorage.setItem(userKey,JSON.stringify(state.user));state.role=profile.role;state.screen='app';state.page='home';state.bookmarks=new Set(classData.bookmarks?.[profile.id]||[]);saveDirectoryProfile(state.user);scheduleBrowserReminders();publishCloudProfile(state.user);
   }else{state.pendingUser=user;state.user=null;state.screen='role';}
   render();
 }
@@ -187,7 +251,7 @@ function finishOnboarding(role) {
   localStorage.setItem(`${STORAGE.profile}${profile.uid}`,JSON.stringify(profile));
   saveDirectoryProfile(profile);
   state.user=profile;state.pendingUser=null;state.role=role;state.screen='app';state.page='home';state.bookmarks=new Set(classData.bookmarks?.[profile.id]||[]);
-  render();scheduleBrowserReminders();toast(`${role} account ready · ${role} ID ${id}`,true);
+  render();scheduleBrowserReminders();publishCloudProfile(profile);toast(`${role} account ready · ${role} ID ${id}`,true);
 }
 function endSession() {
   if(live)stopLive();
@@ -214,6 +278,7 @@ function render() {
   const search = $('#global-search');
   if (search) search.addEventListener('input', () => filterSearch(search.value));
   const studentSearch=$('#student-search');if(studentSearch)studentSearch.addEventListener('input',()=>{const q=studentSearch.value.trim().toLowerCase();document.querySelectorAll('.searchable-student').forEach(row=>row.style.display=!q||row.dataset.search.includes(q)?'':'none');});
+  syncCloudTeacherData();
 }
 function filterSearch(value) {
   const q = value.trim().toLowerCase();
@@ -239,17 +304,29 @@ function openJoinModal() {
   showModal('Connect to the live call','This offer is only for connecting audio and video to an active WebRTC room. To enroll in a class, use the Class ID from My classes.',`<div class="inline-note"><strong>Live call connection:</strong> Your teacher must start the live room and share the WebRTC offer. You will return an answer code for the teacher to apply.</div><form id="join-form"><div class="field"><label for="class-code">Teacher’s live-call offer (JSON)</label><textarea id="class-code" required placeholder='Paste the live-call offer JSON here…'></textarea><span class="field-hint">Ask your teacher to choose “Create WebRTC invite” in their live classroom.</span></div><div class="field"><label for="join-name">Display name</label><input id="join-name" value="${escapeHtml(state.user?.name||'')}" required></div><div class="modal-actions"><button type="button" class="btn" data-action="close-modal">Cancel</button><button class="btn btn-primary">Connect audio & video ${icon('arrow')}</button></div></form>`);
 }
 function openClassIdModal(){
-  showModal('Join a class','Enter the Class ID shared by the teacher. Listed and unlisted students can join with the code.',`<form id="join-class-id-form"><div class="field"><label for="class-id-input">Class ID</label><input id="class-id-input" required pattern="CL-[A-Za-z0-9]+" placeholder="CL-ABC12345" autocomplete="off"><span class="field-hint">Ask your teacher to share the Class ID shown on the class card.</span></div><div class="inline-note">Class IDs are currently available only in this browser. Joining from another device needs database sync.</div><div class="modal-actions"><button type="button" class="btn" data-action="close-modal">Cancel</button><button class="btn btn-primary">Join class ${icon('arrow')}</button></div></form>`);
+  showModal('Join a class','Enter the Class ID shared by the teacher. Listed and unlisted students can join with the code.',`<form id="join-class-id-form"><div class="field"><label for="class-id-input">Class ID</label><input id="class-id-input" required pattern="CL-[A-Za-z0-9]+" placeholder="CL-ABC12345" autocomplete="off"><span class="field-hint">Ask your teacher to share the Class ID shown on the class card.</span></div><div class="inline-note">Aura Class checks the teacher’s published class list in Firebase and records your membership there.</div><div class="modal-actions"><button type="button" class="btn" data-action="close-modal">Cancel</button><button class="btn btn-primary">Join class ${icon('arrow')}</button></div></form>`);
 }
-function joinClassById(value){
+async function joinClassById(value){
   if(state.role!=='Student')throw new Error('Only a Student account can join a class.');
   const code=String(value||'').replace(/\s+/g,'').toUpperCase();if(!/^CL-[A-Z0-9]+$/.test(code))throw new Error('Enter a valid Class ID, for example CL-ABC12345.');
-  const course=allCourses().find(item=>String(item.id||'').toUpperCase()===code);if(!course)throw new Error('Class ID not found in this browser. Check the code or connect the Realtime Database for cross-device classes.');
-  const id=currentId();classData.enrollments[id]=classData.enrollments[id]||[];if(classData.enrollments[id].includes(course.id))throw new Error('You have already joined this class.');
+  const id=currentId();classData.enrollments[id]=classData.enrollments[id]||[];
+  let course=allCourses().find(item=>String(item.id||'').toUpperCase()===code);let remoteRecord=null;let cloudError=null;
+  if(window.auraClassCloud?.configured){
+    try{remoteRecord=await window.auraClassCloud.findClass(code);}
+    catch(error){cloudError=error;if(!course)throw new Error(`Firebase could not check this Class ID: ${error.message}`);}
+  }
+  if(!course&&remoteRecord){course=cloudCourse(remoteRecord);classData.additionalCourses.push(course);}
+  if(!course)throw new Error('Class ID not found in Firebase. Check the ID and ask the teacher to publish the class online.');
+  if(classData.enrollments[id].includes(course.id))throw new Error('You have already joined this class.');
+  if(remoteRecord&&window.auraClassCloud?.configured){
+    try{remoteRecord=await window.auraClassCloud.joinClass(code,state.user);}
+    catch(error){throw new Error(`The class was found, but Firebase could not save your membership: ${error.message}`);}
+    if(!remoteRecord)throw new Error('Class ID not found in Firebase. Ask the teacher to publish the class again.');
+  }
   classData.enrollments[id].push(course.id);course.studentIds=course.studentIds||[];if(!course.studentIds.includes(id))course.studentIds.push(id);
   classData.rosters[course.teacherId]=classData.rosters[course.teacherId]||[];if(!classData.rosters[course.teacherId].includes(id))classData.rosters[course.teacherId].push(id);
   for(const item of [...classData.assignments,...classData.exams,...classData.routines].filter(record=>record.courseId===course.id)){item.assignedStudents=item.assignedStudents||[];if(!item.assignedStudents.includes(id))item.assignedStudents.push(id);}
-  if(state.user)saveDirectoryProfile(state.user);persistClassData();closeModal();state.page='classes';render();toast(`Joined ${course.title}. Class ID ${course.id}`,true);return course;
+  if(state.user)saveDirectoryProfile(state.user);persistClassData();closeModal();state.page='classes';render();toast(cloudError?`Joined locally, but Firebase sync failed: ${cloudError.message}`:`Joined ${course.title}. Class ID ${course.id}`,!cloudError);return course;
 }
 function openCreateModal() {
   const students=(classData.rosters[currentId()]||[]).map(id=>classData.users.find(user=>user.id===id&&user.role==='Student')).filter(Boolean);
@@ -427,11 +504,23 @@ function drawWhiteboardOperation(message,canvas,ctx){
   if(message.action==='move'){const erasing=message.tool==='erase';ctx.strokeStyle=erasing?'#ffffff':'#178456';ctx.lineWidth=erasing?18:2.5;ctx.lineCap='round';ctx.lineTo(x,y);ctx.stroke();}
 }
 function makeLocalId(prefix){return `${prefix}-${Math.random().toString(36).slice(2,10).toUpperCase()}`;}
-function addStudentToTeacher(studentId,courseIds){
+async function addStudentToTeacher(studentId,courseIds){
   const normalized=String(studentId||'').replace(/\s+/g,'').toUpperCase();if(!/^AC-[A-Z0-9]+$/.test(normalized))throw new Error('Enter a valid Student ID beginning with AC-, for example AC-2048.');if(normalized===currentId())throw new Error('You cannot add your own account as a student.');
-  let student=classData.users.find(user=>user.id.toUpperCase()===normalized&&user.role==='Student');const profilePending=!student;
+  const roster=classData.rosters[currentId()]||(classData.rosters[currentId()]=[]);if(roster.some(id=>id.toUpperCase()===normalized))throw new Error('This student is already on your list.');
+  let student=classData.users.find(user=>user.id.toUpperCase()===normalized&&user.role==='Student');
+  if(window.auraClassCloud?.configured){
+    let remoteStudent=null;
+    try{remoteStudent=await window.auraClassCloud.findStudent(normalized);}
+    catch(error){throw new Error(`Firebase could not verify this Student ID: ${error.message}`);}
+    if(!remoteStudent)throw new Error('Student ID not found in Firebase. Ask the student to sign in once, then try again.');
+    student=mergeCloudStudent(remoteStudent);
+    await window.auraClassCloud.addStudentToRoster(student);
+    for(const courseId of courseIds)await window.auraClassCloud.addStudentToClass(courseId,student);
+  }
+  const profilePending=!student;
   if(!student){student={id:normalized,name:`Student ${normalized.slice(-4)}`,role:'Student',email:'',profilePending:true};classData.users.push(student);}
-  const roster=classData.rosters[currentId()]||(classData.rosters[currentId()]=[]);if(roster.some(id=>id.toUpperCase()===normalized))throw new Error('This student is already on your list.');roster.push(normalized);
+  else if(!classData.users.includes(student))classData.users.push(student);
+  roster.push(normalized);
   classData.enrollments[normalized]=classData.enrollments[normalized]||[];
   for(const courseId of courseIds){if(!classData.enrollments[normalized].includes(courseId))classData.enrollments[normalized].push(courseId);const course=allCourses().find(item=>item.id===courseId);if(course){course.studentIds=course.studentIds||[];if(!course.studentIds.includes(normalized))course.studentIds.push(normalized);}}
   const selected=new Set(courseIds);for(const item of [...classData.assignments,...classData.exams,...classData.routines])if(item.teacherId===currentId()&&selected.has(item.courseId)){item.assignedStudents=item.assignedStudents||[];if(!item.assignedStudents.includes(normalized))item.assignedStudents.push(normalized);}
@@ -528,10 +617,25 @@ document.addEventListener('click', async event => {
 
 document.addEventListener('submit', async event => {
   const form=event.target;
-  if(form.id==='join-class-id-form'){event.preventDefault();try{joinClassById($('#class-id-input').value);}catch(error){toast(error.message);}return;}
+  if(form.id==='join-class-id-form'){event.preventDefault();try{await joinClassById($('#class-id-input').value);}catch(error){toast(error.message);}return;}
   if(form.id==='join-form'){event.preventDefault();try{const offer=$('#class-code').value;const name=$('#join-name').value;closeModal();await connectAsGuest(offer,name);}catch(err){toast(err.message||'Please paste a valid class invite.');}return;}
-  if(form.id==='create-form'){event.preventDefault();const title=$('#class-title').value.trim();const topic=$('#class-topic').value.trim();const dateTime=$('#class-time').value;const duration=Number($('#class-duration').value);const teacherId=currentId();const selected=[...form.querySelectorAll('input[name="new-class-student"]:checked')].map(input=>input.value);const id=makeLocalId('CL');const course={id,teacherId,studentIds:[...selected],title,subtitle:`${state.user?.name||'Teacher'} · ${topic}`,progress:0,code:title.slice(0,1).toUpperCase(),color:'',next:localDateLabel(dateTime),duration:`${duration} min`};classData.additionalCourses=classData.additionalCourses||[];classData.additionalCourses.push(course);for(const studentId of selected){classData.enrollments[studentId]=classData.enrollments[studentId]||[];if(!classData.enrollments[studentId].includes(id))classData.enrollments[studentId].push(id);}classData.routines.push({id:makeLocalId('RT'),courseId:id,teacherId,title,topic,date:dateTime.slice(0,10),time:dateTime.slice(11,16),duration,room:'Live class',assignedStudents:[...selected]});persistClassData();closeModal();state.page='classes';render();scheduleBrowserReminders();toast(`Class created · Class ID ${id}`,true);return;}
-  if(form.id==='add-student-form'){event.preventDefault();const id=$('#student-id-input').value.trim().toUpperCase();const selected=[...form.querySelectorAll('input[name="student-course"]:checked')].map(input=>input.value);try{const result=addStudentToTeacher(id,selected);closeModal();state.page='student-list';render();toast(result.profilePending?'ID added to this browser’s roster. Connect the Realtime Database to verify and sync the account across devices.':'Student added to your class list.',true);}catch(error){toast(error.message);}return;}
+  if(form.id==='create-form'){
+    event.preventDefault();
+    const title=$('#class-title').value.trim();const topic=$('#class-topic').value.trim();const dateTime=$('#class-time').value;const duration=Number($('#class-duration').value);const teacherId=currentId();
+    const selected=[...form.querySelectorAll('input[name="new-class-student"]:checked')].map(input=>input.value);const id=makeLocalId('CL');
+    const course={id,teacherId,ownerUid:state.user?.uid||'',studentIds:[...selected],title,topic,subtitle:`${state.user?.name||'Teacher'} · ${topic}`,progress:0,code:title.slice(0,1).toUpperCase(),color:'',next:localDateLabel(dateTime),duration:`${duration} min`,createdAt:new Date().toISOString()};
+    classData.additionalCourses=classData.additionalCourses||[];classData.additionalCourses.push(course);
+    for(const studentId of selected){classData.enrollments[studentId]=classData.enrollments[studentId]||[];if(!classData.enrollments[studentId].includes(id))classData.enrollments[studentId].push(id);}
+    classData.routines.push({id:makeLocalId('RT'),courseId:id,teacherId,title,topic,date:dateTime.slice(0,10),time:dateTime.slice(11,16),duration,room:'Live class',assignedStudents:[...selected]});persistClassData();
+    let publishError='';
+    if(window.auraClassCloud?.configured){
+      try{const selectedProfiles=classData.users.filter(user=>selected.includes(user.id)&&user.role==='Student');await window.auraClassCloud.publishClass(course,selectedProfiles);}
+      catch(error){publishError=error.message||'Firebase could not publish the class.';console.warn('Aura Class class publish failed:',error);}
+    }
+    closeModal();state.page='classes';render();scheduleBrowserReminders();
+    toast(publishError?`Class saved here, but not shared online: ${publishError} · ID ${id}`:window.auraClassCloud?.configured?`Class published · Class ID ${id}`:`Class created · Class ID ${id}`,!publishError);return;
+  }
+  if(form.id==='add-student-form'){event.preventDefault();const id=$('#student-id-input').value.trim().toUpperCase();const selected=[...form.querySelectorAll('input[name="student-course"]:checked')].map(input=>input.value);try{const result=await addStudentToTeacher(id,selected);closeModal();state.page='student-list';render();toast(result.profilePending?'Student ID added on this browser. The student must sign in before the ID can sync online.':'Student added to your class list.',true);}catch(error){toast(error.message);}return;}
   if(form.id==='routine-form'){event.preventDefault();const courseId=$('#routine-course').value;const course=allCourses().find(item=>item.id===courseId);const dateTime=$('#routine-time').value;const roster=classData.rosters[currentId()]||[];classData.routines.push({id:makeLocalId('RT'),courseId,teacherId:currentId(),title:course?.title||'Class session',topic:$('#routine-topic').value.trim(),date:dateTime.slice(0,10),time:dateTime.slice(11,16),duration:Number($('#routine-duration').value),room:$('#routine-room').value.trim()||'Live class',assignedStudents:roster.filter(studentId=>(classData.enrollments[studentId]||[]).includes(courseId))});if(course)course.next=localDateLabel(dateTime);persistClassData();closeModal();state.page='schedule';render();scheduleBrowserReminders();toast('The routine is now visible to assigned students.',true);return;}
   if(form.id==='teacher-exam-form'){event.preventDefault();const courseId=$('#exam-course').value;const due=$('#exam-date').value;const dueDate=new Date(due);if(!Number.isFinite(dueDate.getTime())||dueDate.getTime()<=Date.now()){toast('Choose a future exam deadline.');return;}const students=(classData.rosters[currentId()]||[]).filter(studentId=>(classData.enrollments[studentId]||[]).includes(courseId));const type=$('#exam-type').value;const rawChoices=['#exam-choice-0','#exam-choice-1','#exam-choice-2','#exam-choice-3'].map(selector=>$(selector).value.trim());const choices=rawChoices.filter(Boolean);const correctValue=Number($('#exam-correct').value);if(type==='mcq'&&(choices.length<2||!rawChoices[correctValue])){toast('Add at least two choices and set a valid correct answer.');return;}const question={type,prompt:$('#exam-prompt').value.trim(),points:Number($('#exam-points').value)||1};if(type==='mcq'){question.choices=choices;question.correct=rawChoices.slice(0,correctValue+1).filter(Boolean).length-1;question.negativeMarking=Number($('#exam-negative').value)||0;}classData.exams.push({id:makeLocalId('EX'),teacherId:currentId(),courseId,title:$('#exam-title').value.trim(),detail:`1 question · ${$('#exam-duration').value} minutes`,dueAt:dueDate.toISOString(),date:due,duration:Number($('#exam-duration').value),assignedStudents:students,questions:[question]});persistClassData();closeModal();state.page='exams';render();toast(`Exam published for ${students.length} students.`,true);return;}
   if(form.id==='create-assignment-form'){event.preventDefault();const courseId=$('#assignment-course').value;const course=courseFor(courseId);const dueAt=$('#assignment-due').value;const dueDate=new Date(dueAt);if(!Number.isFinite(dueDate.getTime())||dueDate.getTime()<=Date.now()){toast('Choose a future assignment deadline.');return;}const students=(classData.rosters[currentId()]||[]).filter(studentId=>(classData.enrollments[studentId]||[]).includes(courseId));classData.assignments.push({id:makeLocalId('AS'),teacherId:currentId(),courseId,title:$('#assignment-title').value.trim(),instructions:$('#assignment-instructions').value.trim(),dueAt:dueDate.toISOString(),assignedStudents:students,points:100,createdAt:new Date().toISOString()});persistClassData();closeModal();state.page='assignments';render();toast(`Assignment published for ${students.length} students.`,true);return;}
