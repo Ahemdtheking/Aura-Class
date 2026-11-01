@@ -1,36 +1,41 @@
 # Aura Class
 
-A responsive, browser-based online classroom interface inspired by the supplied home-page reference.
+A responsive web classroom for separate Student and Teacher accounts, inspired by the supplied home-page reference.
 
-## Open locally
+## Run the app
 
-Serve this folder from localhost so browsers can grant camera and microphone access:
+1. Extract the project folder.
+2. Start a local web server inside it:
 
-```powershell
-cd "C:\Users\Tafazzul Ahmed Mahim\Documents\Codex\2026-11-01\go\outputs"
-py -m http.server 8000
-```
+   ```powershell
+   py -m http.server 8000
+   ```
 
-Then visit [http://localhost:8000](http://localhost:8000). Camera and microphone permissions are requested when you join or create a class.
+3. Open `http://localhost:8000`.
+4. Sign in with Google or Facebook. On first sign-in, select Student or Teacher. Firebase Authentication providers must be enabled, and `localhost` must be listed under Authentication → Settings → Authorized domains.
 
-## Google and Facebook accounts
+Camera and microphone access requires `localhost` or HTTPS. A direct `file://` open will not support sign-in or WebRTC correctly.
 
-Sign-in uses the supplied Firebase project config in `firebase-config.js`. The Web SDK initializes Firebase Authentication and Analytics. Enable Google and Facebook in Authentication > Sign-in method and add the app host to Authorized domains. Facebook also needs its Facebook Login app credentials configured in Firebase. See Firebase’s setup guides for [Google](https://firebase.google.com/docs/auth/web/google-signin) and [Facebook](https://firebase.google.com/docs/auth/web/facebook-login). After a first successful sign-in, the user chooses **Student** or **Teacher**; Aura Class then shows a separate `AC-…` Student ID or `TC-…` Teacher ID.
+## Firebase setup
 
-The **Student preview** and **Teacher preview** buttons are local demo accounts. Their sample roster and schedules are saved in this browser. Real accounts can sign in once Firebase is configured.
+`firebase-config.js` contains the Firebase Web App config. The Realtime Database endpoint is left blank because the Console page URL is not the database endpoint. In Firebase Console → Realtime Database → Data, copy the database URL displayed above the JSON tree and set it as `databaseURL` in `firebase-config.js`.
 
-## WebRTC classroom
+The endpoint typically looks like `https://<database-name>.firebaseio.com` for `us-central1` or `https://<database-name>.<region>.firebasedatabase.app` for other regions. Follow Firebase’s [Realtime Database Web setup guide](https://firebase.google.com/docs/database/web/start) and configure authenticated security rules before enabling shared data. Do not use a database secret in browser code.
 
-The live room uses browser `getUserMedia`, `RTCPeerConnection`, and `RTCDataChannel` for audio/video, peer chat, screen sharing, and reactions. To connect two browsers without a signaling service:
+Google and Facebook sign-in use Firebase Authentication. Facebook additionally requires an app ID and secret configured in Firebase; never put the Facebook secret in this project.
 
-1. The host starts a class, selects the people icon, and copies the WebRTC offer.
-2. The guest selects **Join a class**, pastes the offer, and copies the generated answer.
-3. The host chooses **I have an answer**, pastes the guest answer, and connects.
+## Features currently in this project
 
-The sample config uses a public STUN server. Some networks need a TURN relay for peer-to-peer media to connect.
+- Student and Teacher sign-in roles with separate `AC-…` and `TC-…` IDs.
+- Profile details, teacher student list, ID-based roster entry, and course assignment.
+- Teacher-created classes, class routines, assignments, MCQ/descriptive exams, and grading.
+- Student materials, bookmarks, submissions, exam results, announcements, and discussions.
+- Browser class reminders while the app is open.
+- WebRTC audio/video, peer chat, reactions, screen sharing, and a data-channel whiteboard.
+- Local WebM recording download, resource playback speed controls, and resource downloads.
 
-## Prototype data
+## Current storage and call limits
 
-The student view only lists classes, routines, and exams assigned to its Student ID. Teachers can create classes, add student IDs to their roster, publish routines, and assign exams. In this browser preview, roster, course, routine, and exam changes are stored in `localStorage`; connecting different users across devices needs a Realtime Database URL and access rules. The Firebase snippet did not include a database URL.
+Class records, roster changes, resource files, submissions, and results are saved in this browser’s `localStorage`; they do not synchronize between different accounts or devices yet. Until a Realtime Database endpoint and secure rules are configured and the data layer is connected, a teacher cannot verify another device’s Student ID account. An ID that is not in this browser appears as a pending profile.
 
-The live classroom uses browser WebRTC. When there is no signaling service configured, participants exchange the WebRTC offer and answer manually using the **Connect a participant** and **Join a class** flows. Audio/video runs peer-to-peer; the sample setup uses a public STUN server. The record control saves a local WebM file. Cloud recording, persistent video/resources, and push notifications require additional backend services.
+Live media uses WebRTC peer-to-peer. To connect, the teacher starts a live room and shares the generated offer; the student pastes it, returns an answer, and the teacher applies that answer. Both browsers must remain open during setup. A public STUN server is configured; some networks require a TURN relay. Push notifications while the app is closed, cloud recordings, and cloud file storage need additional Firebase services and deployment configuration.
